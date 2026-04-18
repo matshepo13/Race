@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass
 
+from domain.profile import LevelOneProfile, default_level_one_profile
 from domain.race import LevelData
 from domain.strategy import CornerAction, LapPlan, PitAction, RacePlan, StraightAction
 from domain.track import TrackSegment
@@ -10,7 +12,6 @@ from domain.tyre import TyreCompoundProperties
 
 
 EPSILON = 1e-9
-LEVEL_ONE_CORNER_SAFETY_MARGIN_MPS = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,8 +23,24 @@ class SimulationResult:
     final_score: float
 
 
+@dataclass(frozen=True, slots=True)
+class SweepCandidate:
+    representative_profile: LevelOneProfile
+    source_profiles: tuple[LevelOneProfile, ...]
+    race_plan: RacePlan
+    self_result: SimulationResult
+    average_cross_score: float
+    worst_cross_score: float
+    best_cross_score: float
+
+
 class StrategyService:
-    def solve(self, level_data: LevelData) -> tuple[RacePlan, SimulationResult]:
+    def solve(
+        self,
+        level_data: LevelData,
+        profile: LevelOneProfile | None = None,
+    ) -> tuple[RacePlan, SimulationResult]:
+        level_one_profile = profile or default_level_one_profile()
         if level_data.race.level != 1:
             raise NotImplementedError(
                 "This optimizer currently implements exact solving for Level 1 inputs."
@@ -38,8 +55,13 @@ class StrategyService:
                 level_data=level_data,
                 tyre_set_id=tyre_set.set_id,
                 tyre_properties=tyre_properties,
+                profile=level_one_profile,
             )
-            candidate_result = self.simulate(level_data, candidate_plan)
+            candidate_result = self.simulate(
+                level_data,
+                candidate_plan,
+                profile=level_one_profile,
+            )
 
             if best_result is None:
                 best_plan = candidate_plan
@@ -69,7 +91,85 @@ class StrategyService:
 
         return best_plan, best_result
 
-    def simulate(self, level_data: LevelData, race_plan: RacePlan) -> SimulationResult:
+    def sweep_level_one_candidates(
+        self,
+        level_data: LevelData,
+        profiles: tuple[LevelOneProfile, ...],
+    ) -> tuple[SweepCandidate, ...]:
+        if level_data.race.level != 1:
+            raise NotImplementedError(
+                "Candidate sweeps are currently implemented for Level 1 only."
+            )
+
+        grouped_candidates: dict[
+            str,
+            dict[str, RacePlan | list[tuple[LevelOneProfile, SimulationResult]]],
+        ] = {}
+        for profile in profiles:
+            race_plan, simulation_result = self.solve(level_data, profile=profile)
+            plan_key = json.dumps(race_plan.to_dict(), sort_keys=True)
+
+            if plan_key not in grouped_candidates:
+                grouped_candidates[plan_key] = {
+                    "race_plan": race_plan,
+                    "profile_results": [(profile, simulation_result)],
+                }
+                continue
+
+            grouped_candidates[plan_key]["profile_results"].append(
+                (profile, simulation_result)
+            )
+
+        sweep_candidates: list[SweepCandidate] = []
+        for grouped_candidate in grouped_candidates.values():
+            race_plan = grouped_candidate["race_plan"]
+            profile_results = grouped_candidate["profile_results"]
+            representative_profile, self_result = max(
+                profile_results,
+                key=lambda item: (
+                    item[1].final_score,
+                    -item[1].total_time_s,
+                    item[0].name,
+                ),
+            )
+            cross_scores = [
+                self.simulate(level_data, race_plan, profile=profile).final_score
+                for profile in profiles
+            ]
+            sweep_candidates.append(
+                SweepCandidate(
+                    representative_profile=representative_profile,
+                    source_profiles=tuple(
+                        profile for profile, _simulation_result in profile_results
+                    ),
+                    race_plan=race_plan,
+                    self_result=self_result,
+                    average_cross_score=sum(cross_scores) / len(cross_scores),
+                    worst_cross_score=min(cross_scores),
+                    best_cross_score=max(cross_scores),
+                )
+            )
+
+        return tuple(
+            sorted(
+                sweep_candidates,
+                key=lambda candidate: (
+                    candidate.average_cross_score,
+                    candidate.worst_cross_score,
+                    candidate.self_result.final_score,
+                    candidate.representative_profile.name,
+                ),
+                reverse=True,
+            )
+        )
+
+    def simulate(
+        self,
+        level_data: LevelData,
+        race_plan: RacePlan,
+        profile: LevelOneProfile | None = None,
+    ) -> SimulationResult:
+        level_one_profile = profile or default_level_one_profile()
         if level_data.race.level != 1:
             raise NotImplementedError(
                 "Simulation beyond Level 1 has not been implemented yet."
@@ -82,6 +182,9 @@ class StrategyService:
         total_time_s = 0.0
 
         for lap in race_plan.laps:
+            if level_one_profile.lap_start_speed_mode == "reset_zero":
+                current_speed = 0.0
+
             for action in lap.segments:
                 segment = segment_lookup[action.segment_id]
                 weather = level_data.weather.condition_at(total_time_s)
@@ -108,6 +211,7 @@ class StrategyService:
                     crawl_constant_mps=level_data.car.crawl_constant_mps,
                     weather_condition=weather.condition,
                     corner_crash_penalty_s=level_data.race.corner_crash_penalty_s,
+                    profile=level_one_profile,
                 )
                 total_time_s += delta_time
 
@@ -127,17 +231,22 @@ class StrategyService:
         level_data: LevelData,
         tyre_set_id: int,
         tyre_properties: TyreCompoundProperties,
+        profile: LevelOneProfile,
     ) -> RacePlan:
         weather_condition = level_data.weather.condition_at(0.0).condition
         lap_plans: list[LapPlan] = []
         entry_speed_mps = 0.0
 
         for lap_number in range(1, level_data.race.laps + 1):
+            if profile.lap_start_speed_mode == "reset_zero":
+                entry_speed_mps = 0.0
+
             segment_actions, entry_speed_mps = self._build_level_one_lap(
                 level_data=level_data,
                 entry_speed_mps=entry_speed_mps,
                 tyre_properties=tyre_properties,
                 weather_condition=weather_condition,
+                profile=profile,
             )
             lap_plans.append(
                 LapPlan(
@@ -155,6 +264,7 @@ class StrategyService:
         entry_speed_mps: float,
         tyre_properties: TyreCompoundProperties,
         weather_condition: str,
+        profile: LevelOneProfile,
     ) -> tuple[list[StraightAction | CornerAction], float]:
         segments = level_data.track.segments
         corner_block_limits = self._corner_block_speed_limits(
@@ -162,6 +272,7 @@ class StrategyService:
             tyre_properties=tyre_properties,
             weather_condition=weather_condition,
             crawl_constant_mps=level_data.car.crawl_constant_mps,
+            profile=profile,
         )
 
         actions: list[StraightAction | CornerAction] = []
@@ -206,6 +317,7 @@ class StrategyService:
         tyre_properties: TyreCompoundProperties,
         weather_condition: str,
         crawl_constant_mps: float,
+        profile: LevelOneProfile,
     ) -> dict[int, float]:
         block_limits: dict[int, float] = {}
         index = 0
@@ -228,8 +340,11 @@ class StrategyService:
                         weather_condition=weather_condition,
                         radius_m=corner.radius_m or 0.0,
                         crawl_constant_mps=crawl_constant_mps,
+                        dry_multiplier_mode=profile.dry_multiplier_mode,
+                        corner_limit_mode=profile.corner_limit_mode,
                     )
-                    - LEVEL_ONE_CORNER_SAFETY_MARGIN_MPS,
+                    * profile.corner_limit_scale
+                    - profile.corner_safety_margin_mps,
                 )
                 for corner in block_segments
             )
@@ -369,13 +484,16 @@ class StrategyService:
         crawl_constant_mps: float,
         weather_condition: str,
         corner_crash_penalty_s: float,
+        profile: LevelOneProfile,
     ) -> tuple[float, float]:
         max_corner_speed_mps = tyre_properties.corner_speed_limit(
             total_degradation=0.0,
             weather_condition=weather_condition,
             radius_m=segment.radius_m or 0.0,
             crawl_constant_mps=crawl_constant_mps,
-        )
+            dry_multiplier_mode=profile.dry_multiplier_mode,
+            corner_limit_mode=profile.corner_limit_mode,
+        ) * profile.corner_limit_scale
 
         if entry_speed_mps <= EPSILON:
             raise ValueError(f"Corner {segment.id} cannot be entered at zero speed.")

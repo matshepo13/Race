@@ -33,12 +33,16 @@ class TyreCompoundProperties:
     light_rain_degradation: float
     heavy_rain_degradation: float
 
-    def friction_multiplier_for(self, weather_condition: str) -> float:
+    def friction_multiplier_for(
+        self,
+        weather_condition: str,
+        dry_multiplier_mode: str = "table",
+    ) -> float:
         condition = normalize_weather_condition(weather_condition)
         mapping = {
-            # The published dry-weather example uses a multiplier of 1.0 even
-            # though the table lists compound-specific dry multipliers.
-            "dry": 1.0,
+            "dry": (
+                1.0 if dry_multiplier_mode == "unity" else self.dry_friction_multiplier
+            ),
             "cold": self.cold_friction_multiplier,
             "light_rain": self.light_rain_friction_multiplier,
             "heavy_rain": self.heavy_rain_friction_multiplier,
@@ -55,11 +59,19 @@ class TyreCompoundProperties:
         }
         return mapping[condition]
 
-    def friction(self, total_degradation: float, weather_condition: str) -> float:
+    def friction(
+        self,
+        total_degradation: float,
+        weather_condition: str,
+        dry_multiplier_mode: str = "table",
+    ) -> float:
         return max(
             0.0,
             (self.base_friction_coefficient - total_degradation)
-            * self.friction_multiplier_for(weather_condition),
+            * self.friction_multiplier_for(
+                weather_condition,
+                dry_multiplier_mode=dry_multiplier_mode,
+            ),
         )
 
     def corner_speed_limit(
@@ -68,11 +80,24 @@ class TyreCompoundProperties:
         weather_condition: str,
         radius_m: float,
         crawl_constant_mps: float,
+        dry_multiplier_mode: str = "table",
+        corner_limit_mode: str = "sqrt_plus_outside",
     ) -> float:
-        friction = self.friction(total_degradation, weather_condition)
-        # The judge appears to cap cornering speed strictly from tyre grip,
-        # without adding crawl speed to the allowed corner entry speed.
-        return math.sqrt(friction * GRAVITY_MPS2 * radius_m)
+        friction = self.friction(
+            total_degradation,
+            weather_condition,
+            dry_multiplier_mode=dry_multiplier_mode,
+        )
+        grip_term = friction * GRAVITY_MPS2 * radius_m
+
+        if corner_limit_mode == "sqrt_only":
+            return math.sqrt(grip_term)
+        if corner_limit_mode == "sqrt_plus_outside":
+            return math.sqrt(grip_term) + crawl_constant_mps
+        if corner_limit_mode == "sqrt_plus_inside":
+            return math.sqrt(grip_term + crawl_constant_mps)
+
+        raise ValueError(f"Unsupported corner_limit_mode: {corner_limit_mode}")
 
 
 @dataclass(frozen=True, slots=True)
